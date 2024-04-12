@@ -2,8 +2,11 @@ package main
 
 import (
 	"fmt"
+	"math/rand"
 	"net/http"
 	"os"
+	"strconv"
+	"time"
 )
 
 func fetch(url string, ch chan bool, countCh chan int) {
@@ -20,14 +23,23 @@ func fetch(url string, ch chan bool, countCh chan int) {
 
 	// No almacenar el contenido, solo imprimir el estado de la respuesta
 	//fmt.Printf("Descargado: %s - Estado: %s\n", url, resp.Status)
-	ch <- true // Indicar al canal que la solicitud ha sido exitosa
+	if resp.StatusCode != 200 {
+		ch <- false // Indicar al canal que la solicitud ha fallado
+	} else {
+		ch <- true // Indicar al canal que la solicitud ha sido exitosa
+	}
+
 }
 
 func main() {
 	// Definir la URL a la que se harán las solicitudes
-	var url string
+	var urlScan string
 	fmt.Print("url: ")
-	fmt.Scanf("%s\n", &url)
+	fmt.Scanf("%s\n", &urlScan)
+
+	//concateno un numero random automaticamente para que no se cachee la url
+	rand.Seed(time.Now().UnixNano())
+	url := urlScan + "?random=" + strconv.Itoa(rand.Intn(1000000000))
 
 	// Definir la cantidad de goroutines (hilos) a abrir
 	numGoroutines := 5000
