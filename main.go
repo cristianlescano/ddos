@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-func fetch(url string, ch chan bool, countCh chan int) {
+func fetch(url string, ch chan bool, countCh chan int, sleep int) {
 	resp, err := http.Get(url)
 	if err != nil {
 		//fmt.Printf("Error al obtener la URL %s: %s\n", url, err)
@@ -17,7 +17,7 @@ func fetch(url string, ch chan bool, countCh chan int) {
 		return
 	}
 	defer resp.Body.Close()
-
+	time.Sleep(time.Duration(sleep) * time.Millisecond)
 	// Incrementar el contador
 	countCh <- 1
 
@@ -42,7 +42,22 @@ func main() {
 	url := urlScan + "?random=" + strconv.Itoa(rand.Intn(1000000000))
 
 	// Definir la cantidad de goroutines (hilos) a abrir
-	numGoroutines := 5000
+	var numGoroutinesInput string
+	fmt.Print("nro rutinas: ")
+	fmt.Scanf("%s\n", &numGoroutinesInput)
+
+	numGoroutines, _ := strconv.Atoi(numGoroutinesInput)
+
+	if numGoroutines < 1 {
+		fmt.Println("El número de goroutines debe ser al menos 1")
+		os.Exit(1)
+	}
+
+	var numSleepInput string
+	fmt.Print("sleep: ")
+	fmt.Scanf("%s\n", &numSleepInput)
+
+	numSleep, _ := strconv.Atoi(numSleepInput)
 
 	// Crear un canal para comunicarse entre las goroutines y el hilo principal
 	ch := make(chan bool)
@@ -52,7 +67,7 @@ func main() {
 
 	// Iniciar 10 goroutines
 	for i := 0; i < numGoroutines; i++ {
-		go fetch(url, ch, countCh)
+		go fetch(url, ch, countCh, numSleep)
 	}
 
 	// Mantener siempre 10 goroutines activas
@@ -68,7 +83,7 @@ func main() {
 				totalRequestsErr++
 			}
 			// Lanzar una nueva goroutine para reemplazarla
-			go fetch(url, ch, countCh)
+			go fetch(url, ch, countCh, numSleep)
 		case count := <-countCh:
 			// Imprimir el total de solicitudes exitosas
 			fmt.Fprintf(os.Stdout, "\rTotal de solicitudes exitosas: %d, Errores: %d ", totalRequests+count, totalRequestsErr)
@@ -76,4 +91,8 @@ func main() {
 	}
 }
 
-// go build -o bum.exe bum.go
+// update .syso
+// $GOPATH/bin/rsrc -arch 386 -ico img/icon1.ico
+// $GOPATH/bin/rsrc -arch amd64 -ico img/icon1.ico
+
+// go build
