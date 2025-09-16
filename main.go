@@ -12,8 +12,19 @@ import (
 	"github.com/leekchan/accounting"
 )
 
-func fetch(url string, ch chan bool, sleep int, sizeMB chan float64) {
-	resp, err := http.Get(url + "?random=" + strconv.Itoa(rand.Intn(1000000000)))
+func fetch(url string, ch chan bool, sleep int, sizeMB chan float64, cookies string) {
+	client := &http.Client{}
+	req, err := http.NewRequest("GET", url+"?random="+strconv.Itoa(rand.Intn(1000000000)), nil)
+	if err != nil {
+		ch <- false
+		return
+	}
+
+	if cookies != "" {
+		req.Header.Set("Cookie", cookies)
+	}
+
+	resp, err := client.Do(req)
 	if err != nil {
 		//fmt.Printf("Error al obtener la URL %s: %s\n", url, err)
 		ch <- false // Indicar al canal que la solicitud ha fallado
@@ -42,6 +53,11 @@ func main() {
 	fmt.Print("url: ")
 	fmt.Scanf("%s\n", &urlScan)
 
+	// Definir cookies
+	var cookiesInput string
+	fmt.Print("cookies (presiona Enter si no hay): ")
+	fmt.Scanf("%s\n", &cookiesInput)
+
 	// Definir la cantidad de goroutines (hilos) a abrir
 	var numGoroutinesInput string
 	fmt.Print("nro rutinas: ")
@@ -66,9 +82,9 @@ func main() {
 	// Crear un canal mostrar el tamaño de la respuesta
 	sizeMB := make(chan float64)
 
-	// Iniciar 10 goroutines
+	// Iniciar goroutines
 	for i := 0; i < numGoroutines; i++ {
-		go fetch(urlScan, ch, numSleep, sizeMB)
+		go fetch(urlScan, ch, numSleep, sizeMB, cookiesInput)
 	}
 
 	ac := accounting.Accounting{
@@ -93,7 +109,7 @@ func main() {
 				totalRequestsErr++
 			}
 			// Lanzar una nueva goroutine para reemplazarla
-			go fetch(urlScan, ch, numSleep, sizeMB)
+			go fetch(urlScan, ch, numSleep, sizeMB, cookiesInput)
 
 		case size := <-sizeMB:
 			totalSize += size
