@@ -2,9 +2,11 @@ package main
 
 import (
 	"bufio"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"math/rand"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -14,6 +16,8 @@ import (
 
 	"github.com/474420502/gcurl"
 	"github.com/leekchan/accounting"
+	utls "github.com/refraction-networking/utls"
+	"golang.org/x/net/http2"
 )
 
 // ---------------------------------------------------------------------------
@@ -22,10 +26,19 @@ import (
 
 // requestConfig holds all the parameters needed to make an HTTP request
 type requestConfig struct {
-	URL     string
-	Method  string
-	Headers map[string]string
-	Body    io.Reader
+	URLs           []string             // pool of target URLs
+	URL            string               // resolved URL for current request (set by fetch)
+	Method         string
+	Headers        map[string]string
+	Body           io.Reader
+	TLSFingerprint utls.ClientHelloID   // uTLS fingerprint for TLS spoofing
+}
+
+// payloadProfile defines a POST body template with its content type
+type payloadProfile struct {
+	name        string
+	body        string
+	contentType string
 }
 
 // browserProfile represents a coherent set of browser identification headers
@@ -218,6 +231,26 @@ var acceptLanguages = []string{
 }
 
 // ---------------------------------------------------------------------------
+// Payload profiles (POST body rotation)
+// ---------------------------------------------------------------------------
+
+var payloadProfiles = []payloadProfile{
+	// JSON payloads
+	{"json_login", `{"username":"user%d","password":"pass%d","remember":true}`, "application/json"},
+	{"json_search", `{"query":"test%d","page":1,"limit":20,"filters":{}}`, "application/json"},
+	{"json_api", `{"action":"fetch","id":%d,"token":"abc%d","params":{"verbose":true}}`, "application/json"},
+	{"json_comment", `{"post_id":%d,"author":"user%d","body":"Test comment %d","rating":5}`, "application/json"},
+	{"json_form", `{"name":"Test User %d","email":"test%d@example.com","message":"Hello from load test"}`, "application/json"},
+	// Form-encoded payloads
+	{"form_login", "username=user%d&password=pass%d&submit=Login", "application/x-www-form-urlencoded"},
+	{"form_search", "q=test%d&page=1&sort=relevance", "application/x-www-form-urlencoded"},
+	{"form_contact", "name=User%d&email=test%d@test.com&subject=Test&body=Load+test+message", "application/x-www-form-urlencoded"},
+	{"form_register", "username=bot%d&email=bot%d@test.com&password=test123&confirm=test123&agree=1", "application/x-www-form-urlencoded"},
+	// XML payload
+	{"xml_soap", `<?xml version="1.0"?><soap:Envelope><soap:Body><GetItem><ID>%d</ID></GetItem></soap:Body></soap:Envelope>`, "text/xml"},
+}
+
+// ---------------------------------------------------------------------------
 // Cache-buster parameter names
 // ---------------------------------------------------------------------------
 
@@ -236,6 +269,25 @@ func chance(percent int) bool {
 		return true
 	}
 	return rand.Intn(100) < percent
+}
+
+// selectPayload picks a random POST payload and formats it with a random ID.
+func selectPayload() (body string, contentType string) {
+	p := payloadProfiles[rand.Intn(len(payloadProfiles))]
+	id := rand.Intn(100000)
+	// Count %d occurrences to pass correct number of args
+	fmtCount := strings.Count(p.body, "%d")
+	switch fmtCount {
+	case 1:
+		body = fmt.Sprintf(p.body, id)
+	case 2:
+		body = fmt.Sprintf(p.body, id, id)
+	case 3:
+		body = fmt.Sprintf(p.body, id, id, id)
+	default:
+		body = p.body
+	}
+	return body, p.contentType
 }
 
 // selectNavigationProfile picks a random navigation context.
@@ -385,6 +437,7 @@ func isRotatable(header string) bool {
 
 func rotateHeaders(cfg requestConfig) requestConfig {
 	rotated := requestConfig{
+		URLs:    cfg.URLs,
 		URL:     cfg.URL,
 		Method:  cfg.Method,
 		Headers: make(map[string]string),
@@ -451,7 +504,27 @@ func rotateHeaders(cfg requestConfig) requestConfig {
 		rotated.Headers["DNT"] = "1"
 	}
 
+	// TLS fingerprint (coherent with browser profile)
+	rotated.TLSFingerprint = getTLSFingerprint(browser)
+
 	return rotated
+}
+
+// getTLSFingerprint returns the uTLS ClientHelloID that matches the browser profile.
+// This ensures the TLS fingerprint is coherent with the User-Agent being spoofed.
+func getTLSFingerprint(browser browserProfile) utls.ClientHelloID {
+	ua := strings.ToLower(browser.userAgent)
+	if strings.Contains(ua, "firefox") {
+		return utls.HelloFirefox_120
+	}
+	// Safari: must NOT contain chrome/crios/edge/opera
+	if strings.Contains(ua, "safari") && !strings.Contains(ua, "chrome") &&
+		!strings.Contains(ua, "crios") && !strings.Contains(ua, "edg") &&
+		!strings.Contains(ua, "opr") {
+		return utls.HelloSafari_16_0
+	}
+	// Default: Chrome (covers Chrome, Edge, Brave, Opera, Vivaldi, Samsung)
+	return utls.HelloChrome_120
 }
 
 // ---------------------------------------------------------------------------
@@ -479,7 +552,7 @@ func parseCurl(input string) (requestConfig, error) {
 	}
 
 	if parsed.ParsedURL != nil {
-		cfg.URL = parsed.ParsedURL.String()
+		cfg.URLs = []string{parsed.ParsedURL.String()}
 	}
 
 	cfg.Method = parsed.Method
@@ -518,19 +591,63 @@ func parseCurl(input string) (requestConfig, error) {
 // Fetch
 // ---------------------------------------------------------------------------
 
-func fetch(cfg requestConfig, ch chan bool, sleep int, sizeMB chan float64) {
+func fetch(cfg requestConfig, ch chan int, sleep int, sizeMB chan float64, rateLimitSrc chan string) {
 	reqCfg := rotateHeaders(cfg)
 
-	client := &http.Client{}
+	// uTLS transport with real browser TLS fingerprint + HTTP/2 support
+	transport := &http2.Transport{
+		DialTLS: func(network, addr string, _ *tls.Config) (net.Conn, error) {
+			dialer := &net.Dialer{Timeout: 10 * time.Second}
+			conn, err := dialer.Dial(network, addr)
+			if err != nil {
+				return nil, err
+			}
+
+			host, _, err := net.SplitHostPort(addr)
+			if err != nil {
+				host = addr
+			}
+
+			config := &utls.Config{
+				ServerName:         host,
+				InsecureSkipVerify: true,
+				NextProtos:         []string{"h2", "http/1.1"},
+			}
+
+			uconn := utls.UClient(conn, config, reqCfg.TLSFingerprint)
+			if err := uconn.Handshake(); err != nil {
+				return nil, err
+			}
+			return uconn, nil
+		},
+		AllowHTTP: true,
+	}
+
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   30 * time.Second,
+	}
+
+	// Select random target URL (multi-target support)
+	targetURL := cfg.URLs[rand.Intn(len(cfg.URLs))]
+	reqCfg.URL = targetURL
+
+	// POST payload rotation
+	var reqBody io.Reader = reqCfg.Body
+	if (reqCfg.Method == "POST" || reqCfg.Method == "PUT") && reqCfg.Body == nil {
+		body, ct := selectPayload()
+		reqBody = strings.NewReader(body)
+		reqCfg.Headers["Content-Type"] = ct
+	}
 
 	url := reqCfg.URL
 	if reqCfg.Method == "GET" || reqCfg.Method == "" {
 		url = buildCacheBuster(url)
 	}
 
-	req, err := http.NewRequest(reqCfg.Method, url, reqCfg.Body)
+	req, err := http.NewRequest(reqCfg.Method, url, reqBody)
 	if err != nil {
-		ch <- false
+		ch <- 0 // network error
 		return
 	}
 
@@ -540,10 +657,20 @@ func fetch(cfg requestConfig, ch chan bool, sleep int, sizeMB chan float64) {
 
 	resp, err := client.Do(req)
 	if err != nil {
-		ch <- false
+		ch <- 0 // network error
 		return
 	}
 	defer resp.Body.Close()
+
+	// Track 429 source (Cloudflare vs Origin)
+	if resp.StatusCode == 429 {
+		server := resp.Header.Get("Server")
+		if strings.Contains(strings.ToLower(server), "cloudflare") {
+			rateLimitSrc <- "cf"
+		} else {
+			rateLimitSrc <- "origin"
+		}
+	}
 
 	// Jitter: ±25% around the base sleep value
 	if sleep > 0 {
@@ -558,11 +685,7 @@ func fetch(cfg requestConfig, ch chan bool, sleep int, sizeMB chan float64) {
 	sizeKB := float64(size) / 1024.0
 	sizeMB <- sizeKB // envía tamaño en KB
 
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		ch <- true
-	} else {
-		ch <- false
-	}
+	ch <- resp.StatusCode
 }
 
 // ---------------------------------------------------------------------------
@@ -600,21 +723,48 @@ func main() {
 			os.Exit(1)
 		}
 
-		fmt.Printf("URL: %s\n", cfg.URL)
+		// Allow adding more targets
+		fmt.Println("¿Agregar más targets? (Enter para saltar, o pegá otro curl)")
+		for {
+			fmt.Print("curl> ")
+			extra := readLine(reader)
+			if extra == "" {
+				break
+			}
+			extraCfg, err := parseCurl(extra)
+			if err != nil {
+				fmt.Printf("Error parseando curl: %v\n", err)
+				continue
+			}
+			if len(extraCfg.URLs) > 0 {
+				cfg.URLs = append(cfg.URLs, extraCfg.URLs...)
+			}
+		}
+
+		fmt.Printf("URLs: %d targets\n", len(cfg.URLs))
 		fmt.Printf("Method: %s\n", cfg.Method)
 		fmt.Printf("Headers: %d\n", len(cfg.Headers))
 	} else {
-		fmt.Print("url: ")
-		urlScan := readLine(reader)
+		fmt.Println("URLs (una por línea, línea vacía para terminar):")
+		cfg.URLs = []string{}
+		for {
+			fmt.Printf("  target %d> ", len(cfg.URLs)+1)
+			u := readLine(reader)
+			if u == "" {
+				break
+			}
+			cfg.URLs = append(cfg.URLs, u)
+		}
+		if len(cfg.URLs) == 0 {
+			fmt.Println("Se necesita al menos 1 URL")
+			os.Exit(1)
+		}
 
 		fmt.Print("cookies (presiona Enter si no hay): ")
 		cookiesInput := readLine(reader)
 
-		cfg = requestConfig{
-			URL:     urlScan,
-			Method:  "GET",
-			Headers: make(map[string]string),
-		}
+		cfg.Method = "GET"
+		cfg.Headers = make(map[string]string)
 
 		if cookiesInput != "" {
 			cfg.Headers["Cookie"] = cookiesInput
@@ -637,11 +787,12 @@ func main() {
 		os.Exit(1)
 	}
 
-	ch := make(chan bool)
+	ch := make(chan int)
 	sizeMB := make(chan float64)
+	rateLimitSrc := make(chan string)
 
 	for i := 0; i < numGoroutines; i++ {
-		go fetch(cfg, ch, numSleep, sizeMB)
+		go fetch(cfg, ch, numSleep, sizeMB, rateLimitSrc)
 	}
 
 	ac := accounting.Accounting{
@@ -654,18 +805,32 @@ func main() {
 	totalRequests := 0
 	totalRequestsErr := 0
 	totalSize := 0.0
+	statusCodes := make(map[int]int)
+	rateLimitCF := 0
+	rateLimitOrigin := 0
+
 	for {
 		select {
-		case success := <-ch:
-			if success {
+		case statusCode := <-ch:
+			if statusCode >= 200 && statusCode < 300 {
 				totalRequests++
 			} else {
 				totalRequestsErr++
 			}
-			go fetch(cfg, ch, numSleep, sizeMB)
+			if statusCode > 0 {
+				statusCodes[statusCode]++
+			}
+			go fetch(cfg, ch, numSleep, sizeMB, rateLimitSrc)
 
 		case size := <-sizeMB:
 			totalSize += size
+
+		case src := <-rateLimitSrc:
+			if src == "cf" {
+				rateLimitCF++
+			} else {
+				rateLimitOrigin++
+			}
 		}
 
 		sizeProm := 0.0
@@ -690,10 +855,59 @@ func main() {
 			transferStr = fmt.Sprintf("%.2f MB", totalMB)
 		}
 
+		// Status code breakdown with percentages
+		statusStr := buildStatusLine(statusCodes, totalAll)
+
 		sTotalRequests := ac.FormatMoney(totalRequests)
 		sTotalRequestsErr := ac.FormatMoney(totalRequestsErr)
-		fmt.Fprintf(os.Stdout, "\rExitosas: %s | Errores: %s | Acierto: %.1f%% | Prom: %.2f KB | Transferido: %s ", sTotalRequests, sTotalRequestsErr, hitRate, sizeProm, transferStr)
+		fmt.Fprintf(os.Stdout, "\rExitosas: %s | Errores: %s | Acierto: %.1f%% | Prom: %.2f KB | Transferido: %s | RL CF:%s Origin:%s | %s ", sTotalRequests, sTotalRequestsErr, hitRate, sizeProm, transferStr, ac.FormatMoney(rateLimitCF), ac.FormatMoney(rateLimitOrigin), statusStr)
 	}
+}
+
+// buildStatusLine formats status codes for display with percentages
+func buildStatusLine(codes map[int]int, total int) string {
+	if len(codes) == 0 {
+		return ""
+	}
+
+	// Sort by frequency for display
+	type codeCount struct {
+		code  int
+		count int
+	}
+	sorted := make([]codeCount, 0, len(codes))
+	for code, count := range codes {
+		sorted = append(sorted, codeCount{code, count})
+	}
+	// Simple sort by count descending
+	for i := 0; i < len(sorted); i++ {
+		for j := i + 1; j < len(sorted); j++ {
+			if sorted[j].count > sorted[i].count {
+				sorted[i], sorted[j] = sorted[j], sorted[i]
+			}
+		}
+	}
+
+	parts := make([]string, 0, len(sorted))
+	for _, sc := range sorted {
+		pct := 0.0
+		if total > 0 {
+			pct = float64(sc.count) / float64(total) * 100
+		}
+		parts = append(parts, fmt.Sprintf("%d:%s (%.1f%%)", sc.code, acFormat(sc.count), pct))
+	}
+	return strings.Join(parts, " | ")
+}
+
+// acFormat formats a number with thousand separators (inline version of accounting)
+func acFormat(n int) string {
+	ac := accounting.Accounting{
+		Symbol:    "",
+		Precision: 0,
+		Thousand:  ".",
+		Decimal:   "",
+	}
+	return ac.FormatMoney(n)
 }
 
 // update .syso
